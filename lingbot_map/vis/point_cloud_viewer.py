@@ -25,8 +25,6 @@ import cv2
 import matplotlib.cm as cm
 from tqdm.auto import tqdm
 
-import viser
-import viser.transforms as tf
 
 from lingbot_map.utils.geometry import closed_form_inverse_se3, unproject_depth_map_to_point_map
 from lingbot_map.vis.utils import CameraState
@@ -96,8 +94,6 @@ class PointCloudViewer:
         self.model = model
         self.size = size
         self.state_args = state_args
-        self.server = viser.ViserServer(host="0.0.0.0", port=port)
-        self.server.gui.configure_theme(titlebar_content=None, control_layout="collapsible")
         self.device = device
         self.conf_list = conf_list
         self.vis_threshold = vis_threshold
@@ -114,12 +110,37 @@ class PointCloudViewer:
             )
         else:
             self.original_images = []
+            if color_list is not None:
+                for img in color_list:
+                    if len(img) > 0:
+                        # Convert float color (0-1) or uint8 color to uint8 image
+                        if img.dtype != np.uint8:
+                            img = (img * 255).astype(np.uint8)
+                        self.original_images.append(img)
 
         self.pcs, self.all_steps = self.read_data(
             pc_list, color_list, conf_list, edge_color_list
         )
         self.cam_dict = cam_dict
         self.num_frames = len(self.all_steps)
+        
+        # Initialize 2D Bird's-Eye View map limits
+        if self.cam_dict is not None and "t" in self.cam_dict and len(self.all_steps) > 0:
+            cam_positions = np.array([self.cam_dict["t"][s] for s in self.all_steps])
+            x_coords = cam_positions[:, 0]
+            z_coords = cam_positions[:, 2]
+            x_center = (np.min(x_coords) + np.max(x_coords)) / 2.0
+            z_center = (np.min(z_coords) + np.max(z_coords)) / 2.0
+            max_range = max(np.ptp(x_coords), np.ptp(z_coords)) or 1.0
+            padding = max_range * 0.75
+            self.bev_x_min = x_center - padding
+            self.bev_x_max = x_center + padding
+            self.bev_z_min = z_center - padding
+            self.bev_z_max = z_center + padding
+        else:
+            self.bev_x_min, self.bev_x_max = -5.0, 5.0
+            self.bev_z_min, self.bev_z_max = -5.0, 5.0
+
         self.image_mask = image_mask
         self.show_camera = show_camera
         self.on_replay = False
@@ -128,8 +149,6 @@ class PointCloudViewer:
         self.orig_img_list = [x[0] for x in color_list if len(x) > 0] if color_list else []
         self.via_points = []
 
-        self._setup_gui()
-        self.server.on_client_connect(self._connect_client)
 
     def _process_pred_dict(
         self,
@@ -255,730 +274,16 @@ class PointCloudViewer:
 
         return center, max(scale, 0.1)
 
-    def _reset_view_to_direction(
-        self,
-        direction: np.ndarray,
-        up: np.ndarray = np.array([0.0, -1.0, 0.0]),
-        distance_scale: float = 1.5,
-        smooth: bool = True,
-    ):
-        """Reset the viewer camera to look at scene center from a given direction.
 
-        Args:
-            direction: Unit vector pointing FROM the scene center TO the camera.
-            up: Up vector for the camera.
-            distance_scale: Multiplier on scene scale for camera distance.
-            smooth: Whether to smoothly transition.
-        """
-        center, scale = self._compute_scene_center_and_scale()
-        distance = scale * distance_scale
-        position = center + direction * distance
 
-        for client in self.server.get_clients().values():
-            if smooth:
-                self._smooth_camera_transition(
-                    client,
-                    target_position=position,
-                    target_look_at=center,
-                    target_up=up,
-                    duration=0.4,
-                )
-            else:
-                client.camera.up_direction = tuple(up)
-                client.camera.position = tuple(position)
-                client.camera.look_at = tuple(center)
 
-    def _setup_gui(self):
-        """Setup GUI controls."""
-        gui_reset_up = self.server.gui.add_button(
-            "Reset up direction",
-            hint="Set the camera control 'up' direction to the current camera's 'up'.",
-        )
 
-        @gui_reset_up.on_click
-        def _(event: viser.GuiEvent) -> None:
-            client = event.client
-            assert client is not None
-            client.camera.up_direction = tf.SO3(client.camera.wxyz) @ np.array(
-                [0.0, -1.0, 0.0]
-            )
 
-        # Video frame display controls — kept at top so the current frame is always visible
-        with self.server.gui.add_folder("Video Display"):
-            self.show_video_checkbox = self.server.gui.add_checkbox("Show Current Frame", initial_value=True)
-            if hasattr(self, 'original_images') and len(self.original_images) > 0:
-                self.current_frame_image = self.server.gui.add_image(
-                    self.original_images[0], label="Current Frame"
-                )
-            else:
-                self.current_frame_image = None
 
-        # Preset view direction buttons
-        with self.server.gui.add_folder("Reset View Direction"):
-            btn_look_at_center = self.server.gui.add_button(
-                "Look At Scene Center",
-                hint="Reset orbit center to the scene center (fixes orbit after dragging).",
-            )
-            btn_overview = self.server.gui.add_button(
-                "Overview",
-                hint="Reset to a 3/4 overview of the scene.",
-            )
-            btn_front = self.server.gui.add_button(
-                "Front (+Z)",
-                hint="View scene from the front.",
-            )
-            btn_back = self.server.gui.add_button(
-                "Back (-Z)",
-                hint="View scene from the back.",
-            )
-            btn_top = self.server.gui.add_button(
-                "Top (-Y)",
-                hint="View scene from above (bird's eye).",
-            )
-            btn_left = self.server.gui.add_button(
-                "Left (-X)",
-                hint="View scene from the left.",
-            )
-            btn_right = self.server.gui.add_button(
-                "Right (+X)",
-                hint="View scene from the right.",
-            )
-            btn_first_cam = self.server.gui.add_button(
-                "First Camera",
-                hint="Reset to the first camera's viewpoint.",
-            )
 
-        @btn_look_at_center.on_click
-        def _(_) -> None:
-            center, _ = self._compute_scene_center_and_scale()
-            for client in self.server.get_clients().values():
-                client.camera.look_at = tuple(center)
 
-        @btn_overview.on_click
-        def _(_) -> None:
-            d = np.array([0.5, -0.6, 0.6])
-            self._reset_view_to_direction(d / np.linalg.norm(d))
 
-        @btn_front.on_click
-        def _(_) -> None:
-            self._reset_view_to_direction(np.array([0.0, 0.0, 1.0]))
 
-        @btn_back.on_click
-        def _(_) -> None:
-            self._reset_view_to_direction(np.array([0.0, 0.0, -1.0]))
-
-        @btn_top.on_click
-        def _(_) -> None:
-            self._reset_view_to_direction(
-                np.array([0.0, -1.0, 0.0]),
-                up=np.array([0.0, 0.0, 1.0]),
-            )
-
-        @btn_left.on_click
-        def _(_) -> None:
-            self._reset_view_to_direction(np.array([-1.0, 0.0, 0.0]))
-
-        @btn_right.on_click
-        def _(_) -> None:
-            self._reset_view_to_direction(np.array([1.0, 0.0, 0.0]))
-
-        @btn_first_cam.on_click
-        def _(_) -> None:
-            self._move_to_camera(0, smooth=True)
-
-        button3 = self.server.gui.add_button("4D (Only Show Current Frame)")
-        button4 = self.server.gui.add_button("3D (Show All Frames)")
-        self.is_render = False
-        self.fourd = False
-
-        @button3.on_click
-        def _(event: viser.GuiEvent) -> None:
-            self.fourd = True
-
-        @button4.on_click
-        def _(event: viser.GuiEvent) -> None:
-            self.fourd = False
-
-        self.focal_slider = self.server.gui.add_slider(
-            "Focal Length", min=0.1, max=99999, step=1, initial_value=533
-        )
-        self.psize_slider = self.server.gui.add_slider(
-            "Point Size", min=0.00001, max=0.1, step=0.00001, initial_value=self.point_size
-        )
-        self.camsize_slider = self.server.gui.add_slider(
-            "Camera Size", min=0.01, max=0.5, step=0.01, initial_value=0.1
-        )
-        self.downsample_slider = self.server.gui.add_slider(
-            "Downsample Factor", min=1, max=1000, step=1, initial_value=10
-        )
-        self.show_camera_checkbox = self.server.gui.add_checkbox(
-            "Show Camera", initial_value=self.show_camera
-        )
-        self.vis_threshold_slider = self.server.gui.add_slider(
-            "Visibility Threshold", min=1.0, max=5.0, step=0.01,
-            initial_value=self.vis_threshold,
-        )
-        self.camera_downsample_slider = self.server.gui.add_slider(
-            "Camera Downsample Factor", min=1, max=50, step=1, initial_value=1
-        )
-
-        # Screenshot controls
-        with self.server.gui.add_folder("Screenshot"):
-            self.screenshot_button = self.server.gui.add_button("Take Screenshot")
-            self.screenshot_resolution = self.server.gui.add_dropdown(
-                "Resolution",
-                options=["1920x1080", "2560x1440", "3840x2160", "Current"],
-                initial_value="1920x1080",
-            )
-            self.screenshot_path = self.server.gui.add_text(
-                "Save Path", initial_value="screenshot.png"
-            )
-            self.screenshot_status = self.server.gui.add_text(
-                "Status", initial_value="Ready"
-            )
-
-        @self.screenshot_button.on_click
-        def _(event: viser.GuiEvent) -> None:
-            self._take_screenshot(event.client)
-
-        # GLB export controls
-        with self.server.gui.add_folder("Export GLB"):
-            self.glb_output_path = self.server.gui.add_text(
-                "Output Path", initial_value="export.glb"
-            )
-            self.glb_show_cam_checkbox = self.server.gui.add_checkbox(
-                "Include Cameras", initial_value=True,
-            )
-            self.glb_cam_scale_slider = self.server.gui.add_slider(
-                "Camera Scale", min=0.01, max=5.0, step=0.01, initial_value=1.0,
-                hint="Scale factor for camera size in GLB.",
-            )
-            self.glb_frustum_thickness_slider = self.server.gui.add_slider(
-                "Frustum Thickness", min=1.0, max=10.0, step=0.5, initial_value=3.0,
-                hint="Thickness multiplier for camera frustum edges.",
-            )
-            self.glb_trajectory_checkbox = self.server.gui.add_checkbox(
-                "Show Trajectory", initial_value=True,
-                hint="Connect cameras with a trajectory line.",
-            )
-            self.glb_trajectory_radius_slider = self.server.gui.add_slider(
-                "Trajectory Radius", min=0.001, max=0.05, step=0.001, initial_value=0.005,
-                hint="Radius of the trajectory tube.",
-            )
-            self.glb_mode_dropdown = self.server.gui.add_dropdown(
-                "Export Mode",
-                options=["Points", "Spheres"],
-                initial_value="Points",
-                hint="Points: raw (fast). Spheres: each point becomes a small sphere (prettier, slower).",
-            )
-            self.glb_sphere_radius_slider = self.server.gui.add_slider(
-                "Sphere Radius", min=0.001, max=0.1, step=0.001, initial_value=0.005,
-                hint="Radius of each sphere in Spheres mode.",
-                disabled=True,
-            )
-            self.glb_max_sphere_pts_slider = self.server.gui.add_slider(
-                "Max Sphere Points", min=10000, max=500000, step=10000, initial_value=100000,
-                hint="Cap point count for Spheres mode to keep file size manageable.",
-                disabled=True,
-            )
-            self.glb_opacity_slider = self.server.gui.add_slider(
-                "Opacity", min=0.0, max=1.0, step=0.05, initial_value=1.0,
-                hint="Point/sphere opacity (alpha). <1.0 = semi-transparent.",
-            )
-            self.glb_saturation_slider = self.server.gui.add_slider(
-                "Saturation Boost", min=0.0, max=2.0, step=0.1, initial_value=1.0,
-                hint="Color saturation multiplier. >1 = more vivid, <1 = washed out.",
-            )
-            self.glb_brightness_slider = self.server.gui.add_slider(
-                "Brightness Boost", min=0.5, max=2.0, step=0.1, initial_value=1.0,
-                hint="Color brightness multiplier.",
-            )
-            self.glb_export_button = self.server.gui.add_button(
-                "Export GLB",
-                hint="Export current filtered point clouds and cameras as GLB.",
-            )
-            self.glb_status = self.server.gui.add_text("Status", initial_value="Ready")
-
-        @self.glb_mode_dropdown.on_update
-        def _(_) -> None:
-            is_sphere = self.glb_mode_dropdown.value == "Spheres"
-            self.glb_sphere_radius_slider.disabled = not is_sphere
-            self.glb_max_sphere_pts_slider.disabled = not is_sphere
-
-        @self.glb_export_button.on_click
-        def _(_) -> None:
-            self._export_glb()
-
-        # Video saving controls
-        with self.server.gui.add_folder("Video Saving"):
-            self.save_video_button = self.server.gui.add_button("Save Video", disabled=False)
-            self.video_output_path = self.server.gui.add_text("Output Path", initial_value="output_pointcloud.mp4")
-            self.video_save_fps = self.server.gui.add_slider("Video FPS", min=10, max=60, step=1, initial_value=30)
-            self.video_resolution = self.server.gui.add_dropdown(
-                "Resolution", options=["1920x1080", "1280x720", "3840x2160"], initial_value="1920x1080"
-            )
-            self.save_original_video_checkbox = self.server.gui.add_checkbox("Also Save Original Video", initial_value=True)
-            self.video_status = self.server.gui.add_text("Status", initial_value="Ready to save")
-
-        @self.save_video_button.on_click
-        def _(_) -> None:
-            self.save_video(
-                output_path=self.video_output_path.value,
-                fps=self.video_save_fps.value,
-                resolution=self.video_resolution.value,
-                save_original_video=self.save_original_video_checkbox.value
-            )
-
-        @self.show_video_checkbox.on_update
-        def _(_) -> None:
-            if self.current_frame_image is not None:
-                self.current_frame_image.visible = self.show_video_checkbox.value
-
-        self.pc_handles = []
-        self.cam_handles = []
-
-        @self.psize_slider.on_update
-        def _(_) -> None:
-            for handle in self.pc_handles:
-                handle.point_size = self.psize_slider.value
-
-        @self.camsize_slider.on_update
-        def _(_) -> None:
-            for handle in self.cam_handles:
-                handle.scale = self.camsize_slider.value
-                handle.line_thickness = 0.03 * handle.scale
-
-        @self.downsample_slider.on_update
-        def _(_) -> None:
-            self._regenerate_point_clouds()
-
-        @self.show_camera_checkbox.on_update
-        def _(_) -> None:
-            self.show_camera = self.show_camera_checkbox.value
-            if self.show_camera:
-                self._regenerate_cameras()
-            else:
-                for handle in self.cam_handles:
-                    handle.visible = False
-
-        @self.vis_threshold_slider.on_update
-        def _(_) -> None:
-            self.vis_threshold = self.vis_threshold_slider.value
-            self._regenerate_point_clouds()
-
-        @self.camera_downsample_slider.on_update
-        def _(_) -> None:
-            self._regenerate_cameras()
-
-    def _regenerate_point_clouds(self):
-        """Regenerate all point clouds with current settings."""
-        if not hasattr(self, 'frame_nodes'):
-            return
-
-        for handle in self.pc_handles:
-            try:
-                handle.remove()
-            except (KeyError, AttributeError):
-                pass
-        self.pc_handles.clear()
-        self.vis_pts_list.clear()
-
-        for i, step in enumerate(self.all_steps):
-            pc = self.pcs[step]["pc"]
-            color = self.pcs[step]["color"]
-            conf = self.pcs[step]["conf"]
-            edge_color = self.pcs[step].get("edge_color", None)
-
-            pred_pts, pc_color = self.parse_pc_data(
-                pc, color, conf, edge_color, set_border_color=True,
-                downsample_factor=self.downsample_slider.value
-            )
-
-            self.vis_pts_list.append(pred_pts)
-            handle = self.server.scene.add_point_cloud(
-                name=f"/frames/{step}/pred_pts",
-                points=pred_pts,
-                colors=pc_color,
-                point_size=self.psize_slider.value,
-            )
-            self.pc_handles.append(handle)
-
-    def _regenerate_cameras(self):
-        """Regenerate camera visualizations with current settings."""
-        if not hasattr(self, 'frame_nodes'):
-            return
-
-        for handle in self.cam_handles:
-            try:
-                handle.remove()
-            except (KeyError, AttributeError):
-                pass
-        self.cam_handles.clear()
-
-        if self.show_camera:
-            downsample_factor = int(self.camera_downsample_slider.value)
-            for i, step in enumerate(self.all_steps):
-                if i % downsample_factor == 0:
-                    self.add_camera(step)
-
-    def _export_glb(self):
-        """Export current filtered point clouds and cameras as a GLB file."""
-        try:
-            import trimesh
-        except ImportError:
-            self.glb_status.value = "Error: pip install trimesh"
-            return
-
-        self.glb_status.value = "Collecting points..."
-        print("Exporting GLB...")
-
-        # Collect all currently visible, filtered points and colors
-        all_points = []
-        all_colors = []
-        for step in self.all_steps:
-            pc = self.pcs[step]["pc"]
-            color = self.pcs[step]["color"]
-            conf = self.pcs[step]["conf"]
-            edge_color = self.pcs[step].get("edge_color", None)
-
-            pts, cols = self.parse_pc_data(
-                pc, color, conf, edge_color, set_border_color=False,
-                downsample_factor=self.downsample_slider.value,
-            )
-            if len(pts) > 0:
-                all_points.append(pts)
-                if cols.dtype != np.uint8:
-                    cols = (np.clip(cols, 0, 1) * 255).astype(np.uint8)
-                all_colors.append(cols)
-
-        if not all_points:
-            self.glb_status.value = "Error: no points to export"
-            return
-
-        vertices = np.concatenate(all_points, axis=0)
-        colors_rgb = np.concatenate(all_colors, axis=0)
-
-        # --- Color enhancement ---
-        colors_float = colors_rgb.astype(np.float32) / 255.0
-
-        sat_boost = self.glb_saturation_slider.value
-        if sat_boost != 1.0:
-            gray = colors_float.mean(axis=1, keepdims=True)
-            colors_float = gray + sat_boost * (colors_float - gray)
-
-        bri_boost = self.glb_brightness_slider.value
-        if bri_boost != 1.0:
-            colors_float = colors_float * bri_boost
-
-        colors_float = np.clip(colors_float, 0.0, 1.0)
-
-        # --- Opacity ---
-        # Simulate opacity by blending colors toward white (works in all viewers).
-        # For Spheres mode, also set true alpha for viewers that support it.
-        alpha = self.glb_opacity_slider.value
-        if alpha < 1.0:
-            bg = np.ones_like(colors_float)  # white background
-            colors_float = colors_float * alpha + bg * (1.0 - alpha)
-            colors_float = np.clip(colors_float, 0.0, 1.0)
-
-        colors_u8 = (colors_float * 255).astype(np.uint8)
-        colors_rgba = np.concatenate([
-            colors_u8,
-            np.full((len(colors_u8), 1), int(alpha * 255), dtype=np.uint8),
-        ], axis=1)  # (N, 4)
-
-        # Compute scene scale for camera sizing
-        lo = np.percentile(vertices, 5, axis=0)
-        hi = np.percentile(vertices, 95, axis=0)
-        scene_scale = max(np.linalg.norm(hi - lo), 0.1)
-
-        scene_3d = trimesh.Scene()
-
-        # --- Export mode ---
-        export_mode = self.glb_mode_dropdown.value
-        if export_mode == "Spheres":
-            self.glb_status.value = "Building spheres..."
-            max_pts = int(self.glb_max_sphere_pts_slider.value)
-            radius = self.glb_sphere_radius_slider.value
-
-            # Subsample if too many points
-            if len(vertices) > max_pts:
-                idx = np.random.choice(len(vertices), max_pts, replace=False)
-                idx.sort()
-                vertices = vertices[idx]
-                colors_rgba = colors_rgba[idx]
-
-            sphere_template = trimesh.creation.icosphere(subdivisions=1, radius=radius)
-            n_verts_per = len(sphere_template.vertices)
-            n_faces_per = len(sphere_template.faces)
-
-            all_verts = np.empty((len(vertices) * n_verts_per, 3), dtype=np.float32)
-            all_faces = np.empty((len(vertices) * n_faces_per, 3), dtype=np.int64)
-            all_face_colors = np.empty((len(vertices) * n_faces_per, 4), dtype=np.uint8)
-
-            for i, (pt, rgba) in enumerate(zip(vertices, colors_rgba)):
-                v_off = i * n_verts_per
-                f_off = i * n_faces_per
-                all_verts[v_off:v_off + n_verts_per] = sphere_template.vertices + pt
-                all_faces[f_off:f_off + n_faces_per] = sphere_template.faces + v_off
-                all_face_colors[f_off:f_off + n_faces_per] = rgba
-
-            mesh = trimesh.Trimesh(vertices=all_verts, faces=all_faces)
-            mesh.visual.face_colors = all_face_colors
-            # Enable alpha blending in glTF material for true transparency
-            if alpha < 1.0:
-                mesh.visual.material.alphaMode = 'BLEND'
-            scene_3d.add_geometry(mesh)
-            print(f"Spheres mode: {len(vertices):,} spheres, {len(all_faces):,} faces")
-        else:
-            # Points mode (GLB viewers ignore alpha on points, so use blended RGB)
-            scene_3d.add_geometry(trimesh.PointCloud(vertices=vertices, colors=colors_u8))
-
-        # Add cameras and trajectory
-        if self.glb_show_cam_checkbox.value and self.cam_dict is not None:
-            from lingbot_map.vis.glb_export import integrate_camera_into_scene
-            import matplotlib
-            colormap = matplotlib.colormaps.get_cmap("gist_rainbow")
-            num_cameras = len(self.all_steps)
-            cam_positions = []
-
-            frustum_thickness = self.glb_frustum_thickness_slider.value
-            effective_cam_scale = scene_scale * self.glb_cam_scale_slider.value
-
-            for i, step in enumerate(self.all_steps):
-                R = self.cam_dict["R"][step] if "R" in self.cam_dict else np.eye(3)
-                t = self.cam_dict["t"][step] if "t" in self.cam_dict else np.zeros(3)
-
-                c2w = np.eye(4)
-                c2w[:3, :3] = R
-                c2w[:3, 3] = t
-                cam_positions.append(np.array(t, dtype=np.float64))
-
-                rgba_c = colormap(i / max(num_cameras - 1, 1))
-                cam_color = tuple(int(255 * x) for x in rgba_c[:3])
-                integrate_camera_into_scene(
-                    scene_3d, c2w, cam_color,
-                    effective_cam_scale,
-                    frustum_thickness=frustum_thickness,
-                )
-
-            # Add trajectory line as a tube connecting camera positions
-            if self.glb_trajectory_checkbox.value and len(cam_positions) >= 2:
-                traj_pts = np.array(cam_positions)
-                traj_radius = self.glb_trajectory_radius_slider.value * self.glb_cam_scale_slider.value
-                traj_mesh = self._build_trajectory_tube(
-                    traj_pts, traj_radius, colormap, num_cameras
-                )
-                if traj_mesh is not None:
-                    scene_3d.add_geometry(traj_mesh)
-
-        # Align scene using first camera extrinsic
-        if self.cam_dict is not None and len(self.all_steps) > 0:
-            from lingbot_map.vis.glb_export import apply_scene_alignment
-            step0 = self.all_steps[0]
-            R0 = self.cam_dict["R"][step0] if "R" in self.cam_dict else np.eye(3)
-            t0 = self.cam_dict["t"][step0] if "t" in self.cam_dict else np.zeros(3)
-            c2w_0 = np.eye(4)
-            c2w_0[:3, :3] = R0
-            c2w_0[:3, 3] = t0
-            w2c_0 = np.linalg.inv(c2w_0)
-            extrinsics = np.expand_dims(w2c_0, 0)
-            scene_3d = apply_scene_alignment(scene_3d, extrinsics)
-
-        output_path = self.glb_output_path.value
-        scene_3d.export(output_path)
-
-        n_pts = len(vertices)
-        mode_str = f"spheres r={self.glb_sphere_radius_slider.value}" if export_mode == "Spheres" else "points"
-        self.glb_status.value = f"Saved: {output_path} ({n_pts:,} {mode_str})"
-        print(f"GLB exported to {output_path} ({n_pts:,} {mode_str})")
-
-    @staticmethod
-    def _build_trajectory_tube(positions, radius, colormap, num_cameras):
-        """Build a tube mesh following camera trajectory with per-segment color.
-
-        Args:
-            positions: (N, 3) camera positions.
-            radius: Tube radius.
-            colormap: Matplotlib colormap for gradient coloring.
-            num_cameras: Total number of cameras (for color normalization).
-
-        Returns:
-            trimesh.Trimesh or None.
-        """
-        import trimesh
-
-        segments = []
-        for i in range(len(positions) - 1):
-            p0, p1 = positions[i], positions[i + 1]
-            seg_len = np.linalg.norm(p1 - p0)
-            if seg_len < 1e-8:
-                continue
-
-            # Create cylinder along Z, then transform
-            cyl = trimesh.creation.cylinder(radius=radius, height=seg_len, sections=8)
-
-            # Direction vector
-            direction = (p1 - p0) / seg_len
-            mid = (p0 + p1) / 2.0
-
-            # Build rotation: default cylinder is along Z
-            z_axis = np.array([0.0, 0.0, 1.0])
-            v = np.cross(z_axis, direction)
-            c = np.dot(z_axis, direction)
-
-            if np.linalg.norm(v) < 1e-8:
-                rot = np.eye(3) if c > 0 else np.diag([1, -1, -1])
-            else:
-                vx = np.array([[0, -v[2], v[1]],
-                               [v[2], 0, -v[0]],
-                               [-v[1], v[0], 0]])
-                rot = np.eye(3) + vx + vx @ vx / (1.0 + c)
-
-            transform = np.eye(4)
-            transform[:3, :3] = rot
-            transform[:3, 3] = mid
-            cyl.apply_transform(transform)
-
-            # Color: midpoint index
-            t_color = (i + 0.5) / max(num_cameras - 1, 1)
-            rgba = colormap(t_color)
-            color_rgb = tuple(int(255 * x) for x in rgba[:3])
-            cyl.visual.face_colors[:, :3] = color_rgb
-            segments.append(cyl)
-
-        if not segments:
-            return None
-        return trimesh.util.concatenate(segments)
-
-    def update_frame_visibility(self):
-        """Show all frames up to the current timestep (or only the current one in 4D mode)."""
-        if not hasattr(self, 'frame_nodes') or not hasattr(self, 'gui_timestep'):
-            return
-
-        current_timestep = self.gui_timestep.value
-        for i, frame_node in enumerate(self.frame_nodes):
-            frame_node.visible = (
-                i <= current_timestep if not self.fourd else i == current_timestep
-            )
-
-    def _move_to_camera(self, frame_idx: int, smooth: bool = True):
-        """Move viewer camera to match reconstructed camera at given frame."""
-        if self.cam_dict is None:
-            return
-
-        step = self.all_steps[frame_idx] if frame_idx < len(self.all_steps) else self.all_steps[-1]
-
-        R = self.cam_dict["R"][step] if "R" in self.cam_dict else np.eye(3)
-        t = self.cam_dict["t"][step] if "t" in self.cam_dict else np.zeros(3)
-        focal = self.cam_dict["focal"][step] if "focal" in self.cam_dict else 1.0
-        pp = self.cam_dict["pp"][step] if "pp" in self.cam_dict else (1.0, 1.0)
-
-        offset = 0.5
-        viewing_dir = R[:, 2]  # camera Z axis in world frame
-        position = t - viewing_dir * offset
-        look_at = t + viewing_dir * 0.5  # look slightly ahead of camera
-
-        fov = 2 * np.arctan(pp[0] / focal)
-        up = -R[:, 1]  # camera -Y axis in world frame
-
-        for client in self.server.get_clients().values():
-            if smooth:
-                self._smooth_camera_transition(
-                    client,
-                    target_position=position,
-                    target_look_at=look_at,
-                    target_up=up,
-                    target_fov=fov,
-                    duration=0.3,
-                )
-            else:
-                client.camera.up_direction = tuple(up)
-                client.camera.position = tuple(position)
-                client.camera.look_at = tuple(look_at)
-                if fov is not None:
-                    client.camera.fov = fov
-
-    def _smooth_camera_transition(
-        self,
-        client,
-        target_position,
-        target_look_at=None,
-        target_up=None,
-        target_fov=None,
-        duration=0.3,
-    ):
-        """Smoothly transition camera to target pose using look_at based control.
-
-        Args:
-            client: Viser client handle.
-            target_position: Target camera position (3,).
-            target_look_at: Target look-at point (3,). If None, keeps current.
-            target_up: Target up direction (3,). If None, keeps current.
-            target_fov: Target FOV. If None, keeps current.
-            duration: Transition duration in seconds.
-        """
-        def interpolate():
-            num_steps = 15
-            dt = duration / num_steps
-
-            start_position = np.array(client.camera.position, dtype=np.float64)
-            start_look_at = np.array(client.camera.look_at, dtype=np.float64)
-            start_fov = client.camera.fov
-
-            end_position = np.asarray(target_position, dtype=np.float64)
-            end_look_at = np.asarray(target_look_at, dtype=np.float64) if target_look_at is not None else start_look_at
-
-            # Set up direction once at the start (not interpolated to avoid flicker)
-            if target_up is not None:
-                client.camera.up_direction = tuple(np.asarray(target_up, dtype=np.float64))
-
-            for i in range(num_steps + 1):
-                alpha = i / num_steps
-                # Smooth ease-in-out
-                alpha_smooth = alpha * alpha * (3 - 2 * alpha)
-
-                interp_pos = start_position + (end_position - start_position) * alpha_smooth
-                interp_look = start_look_at + (end_look_at - start_look_at) * alpha_smooth
-
-                # Set position first (this auto-moves look_at), then override look_at
-                client.camera.position = tuple(interp_pos)
-                client.camera.look_at = tuple(interp_look)
-
-                if target_fov is not None:
-                    interp_fov = start_fov + (target_fov - start_fov) * alpha_smooth
-                    client.camera.fov = interp_fov
-
-                time.sleep(dt)
-
-        thread = threading.Thread(target=interpolate, daemon=True)
-        thread.start()
-
-    def _slerp(self, q1, q2, t):
-        """Spherical linear interpolation between quaternions."""
-        dot = np.dot(q1, q2)
-
-        if abs(dot) > 0.9995:
-            result = q1 + t * (q2 - q1)
-            return result / np.linalg.norm(result)
-
-        dot = np.clip(dot, -1.0, 1.0)
-        theta_0 = np.arccos(dot)
-        theta = theta_0 * t
-
-        q2_orthogonal = q2 - q1 * dot
-        q2_orthogonal = q2_orthogonal / np.linalg.norm(q2_orthogonal)
-
-        return q1 * np.cos(theta) + q2_orthogonal * np.sin(theta)
-
-    def get_camera_state(self, client: viser.ClientHandle) -> CameraState:
-        """Get current camera state from client."""
-        camera = client.camera
-        c2w = np.concatenate([
-            np.concatenate([tf.SO3(camera.wxyz).as_matrix(), camera.position[:, None]], 1),
-            [[0, 0, 0, 1]],
-        ], 0)
-        return CameraState(fov=camera.fov, aspect=camera.aspect, c2w=c2w)
 
     @staticmethod
     def generate_pseudo_intrinsics(h: int, w: int) -> np.ndarray:
@@ -986,22 +291,6 @@ class PointCloudViewer:
         focal = (h**2 + w**2) ** 0.5
         return np.array([[focal, 0, w // 2], [0, focal, h // 2], [0, 0, 1]]).astype(np.float32)
 
-    def _connect_client(self, client: viser.ClientHandle):
-        """Setup client connection callbacks."""
-        wxyz_panel = client.gui.add_text("wxyz:", f"{client.camera.wxyz}")
-        position_panel = client.gui.add_text("position:", f"{client.camera.position}")
-        fov_panel = client.gui.add_text(
-            "fov:", f"{2 * np.arctan(self.size/self.focal_slider.value) * 180 / np.pi}"
-        )
-        aspect_panel = client.gui.add_text("aspect:", "1.0")
-
-        @client.camera.on_update
-        def _(_: viser.CameraHandle):
-            with self.server.atomic():
-                wxyz_panel.value = f"{client.camera.wxyz}"
-                position_panel.value = f"{client.camera.position}"
-                fov_panel.value = f"{2 * np.arctan(self.size/self.focal_slider.value) * 180 / np.pi}"
-                aspect_panel.value = "1.0"
 
     @staticmethod
     def set_color_border(image, border_width=5, color=[1, 0, 0]):
@@ -1024,6 +313,8 @@ class PointCloudViewer:
         """Read and organize point cloud data."""
         pcs = {}
         step_list = []
+        if pc_list is None:
+            return pcs, step_list
         for i, pc in enumerate(pc_list):
             step = i
             pcs.update({
@@ -1117,52 +408,6 @@ class PointCloudViewer:
             )
         )
 
-    def add_camera(self, step):
-        """Add camera visualization for a frame."""
-        cam = self.cam_dict
-        focal = cam["focal"][step] if cam and "focal" in cam else 1.0
-        pp = cam["pp"][step] if cam and "pp" in cam else (1.0, 1.0)
-        R = cam["R"][step] if cam and "R" in cam else np.eye(3)
-        t = cam["t"][step] if cam and "t" in cam else np.zeros(3)
-
-        q = tf.SO3.from_matrix(R).wxyz
-        fov = 2 * np.arctan(pp[0] / focal)
-        aspect = pp[0] / pp[1]
-        self.traj_list.append((q, t))
-
-        step_index = self.all_steps.index(step) if step in self.all_steps else 0
-        camera_color = self.camera_colors[step_index]
-        camera_color_rgb = tuple((camera_color[:3] * 255).astype(int))
-
-        self.server.scene.add_frame(
-            f"/frames/{step}/camera_frame",
-            wxyz=q,
-            position=t,
-            axes_length=0.05,
-            axes_radius=0.002,
-            origin_radius=0.002,
-        )
-
-        frustum_handle = self.server.scene.add_camera_frustum(
-            name=f"/frames/{step}/camera",
-            fov=fov,
-            aspect=aspect,
-            wxyz=q,
-            position=t,
-            scale=0.03,
-            color=camera_color_rgb,
-        )
-
-        @frustum_handle.on_click
-        def _(event) -> None:
-            look_at_pt = t + R[:, 2] * 0.5  # look ahead along camera Z
-            up_dir = -R[:, 1]
-            for client in self.server.get_clients().values():
-                client.camera.up_direction = tuple(up_dir)
-                client.camera.position = tuple(t)
-                client.camera.look_at = tuple(look_at_pt)
-
-        self.cam_handles.append(frustum_handle)
 
     def animate(self):
         """Setup and run animation controls."""
@@ -1236,137 +481,7 @@ class PointCloudViewer:
 
             time.sleep(1.0 / gui_framerate.value)
 
-    def _take_screenshot(self, client: Optional[Any] = None):
-        """Capture a screenshot from the current view and save to file.
 
-        Args:
-            client: The viser client that triggered the action. If None,
-                    uses the first connected client.
-        """
-        output_path = self.screenshot_path.value
-        res_str = self.screenshot_resolution.value
-
-        # Resolve client
-        if client is None:
-            clients = list(self.server.get_clients().values())
-            if not clients:
-                self.screenshot_status.value = "Error: no client connected"
-                return
-            client = clients[0]
-
-        try:
-            self.screenshot_status.value = "Capturing..."
-
-            if res_str == "Current":
-                # Use default render size
-                width, height = 1920, 1080
-            else:
-                width, height = map(int, res_str.split("x"))
-
-            render = client.camera.get_render(height=height, width=width)
-
-            if render is not None:
-                frame = np.array(render)
-                if frame.shape[2] == 4:
-                    frame = frame[:, :, :3]
-                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                cv2.imwrite(output_path, frame_bgr)
-                self.screenshot_status.value = f"Saved: {output_path}"
-                print(f"Screenshot saved to {output_path} ({width}x{height})")
-            else:
-                self.screenshot_status.value = "Error: render returned None"
-                print("Screenshot failed: render returned None")
-
-        except Exception as e:
-            self.screenshot_status.value = f"Error: {e}"
-            print(f"Screenshot error: {e}")
-
-    def save_video(
-        self,
-        output_path: str = "output_pointcloud.mp4",
-        fps: int = 30,
-        resolution: str = "1920x1080",
-        save_original_video: bool = True
-    ):
-        """Save point cloud animation as video."""
-        try:
-            if hasattr(self, 'video_status'):
-                self.video_status.value = "Saving video..."
-            print(f"Saving video to {output_path}...")
-
-            width, height = map(int, resolution.split('x'))
-            temp_dir = tempfile.mkdtemp(prefix="viser_video_")
-            print(f"Temporary directory: {temp_dir}")
-
-            print("Waiting for client connection...")
-            timeout = 10
-            start_time = time.time()
-            while len(self.server.get_clients()) == 0:
-                time.sleep(0.1)
-                if time.time() - start_time > timeout:
-                    raise RuntimeError("No client connected. Please open the visualization in a browser first.")
-
-            print("Client connected. Starting to render frames...")
-            clients = list(self.server.get_clients().values())
-            client = clients[0]
-
-            if not hasattr(self, 'gui_timestep'):
-                raise RuntimeError("Animation not initialized. Please ensure animate() is called before save_video().")
-
-            for i in tqdm(range(self.num_frames), desc="Rendering frames"):
-                self.gui_timestep.value = i
-                time.sleep(0.1)
-
-                try:
-                    screenshot = client.camera.get_render(height=height, width=width)
-                    if screenshot is not None:
-                        frame = np.array(screenshot)
-                        if frame.shape[2] == 4:
-                            frame = frame[:, :, :3]
-                        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                        frame_path = os.path.join(temp_dir, f"frame_{i:06d}.png")
-                        cv2.imwrite(frame_path, frame)
-                    else:
-                        frame = self._render_frame_fallback(i, width, height)
-                        frame_path = os.path.join(temp_dir, f"frame_{i:06d}.png")
-                        cv2.imwrite(frame_path, frame)
-                except Exception as e:
-                    print(f"Warning: Error capturing frame {i}: {e}, using fallback")
-                    frame = self._render_frame_fallback(i, width, height)
-                    frame_path = os.path.join(temp_dir, f"frame_{i:06d}.png")
-                    cv2.imwrite(frame_path, frame)
-
-            print("Encoding video with ffmpeg...")
-            ffmpeg_cmd = [
-                'ffmpeg', '-y', '-framerate', str(fps),
-                '-i', os.path.join(temp_dir, 'frame_%06d.png'),
-                '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '18',
-                output_path
-            ]
-
-            result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
-
-            if result.returncode == 0:
-                print(f"Point cloud video saved successfully to {output_path}")
-                if hasattr(self, 'video_status'):
-                    self.video_status.value = f"Saved to {output_path}"
-            else:
-                print(f"FFmpeg error: {result.stderr}")
-                if hasattr(self, 'video_status'):
-                    self.video_status.value = "Error: FFmpeg failed"
-
-            if save_original_video and hasattr(self, 'original_images') and len(self.original_images) > 0:
-                self._save_original_video(output_path, fps, width, height)
-
-            shutil.rmtree(temp_dir)
-            print("Temporary files cleaned up")
-
-        except Exception as e:
-            print(f"Error saving video: {e}")
-            import traceback
-            traceback.print_exc()
-            if hasattr(self, 'video_status'):
-                self.video_status.value = f"Error: {str(e)}"
 
     def _save_original_video(self, pointcloud_video_path: str, fps: int, width: int, height: int):
         """Save original images as video."""
@@ -1407,20 +522,160 @@ class PointCloudViewer:
             import traceback
             traceback.print_exc()
 
-    def _render_frame_fallback(self, frame_idx: int, width: int, height: int) -> np.ndarray:
-        """Fallback rendering when screenshot capture fails."""
-        if hasattr(self, 'original_images') and frame_idx < len(self.original_images):
-            frame = self.original_images[frame_idx].copy()
-            frame = cv2.resize(frame, (width, height))
-            cv2.putText(frame, f"Frame {frame_idx}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            return frame
-        else:
-            frame = np.zeros((height, width, 3), dtype=np.uint8)
-            cv2.putText(frame, f"Frame {frame_idx} - No render available",
-                        (width//4, height//2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-            return frame
+
+
+    def process_uploaded_video(self, file_name: str, file_content: bytes):
+        """Processes uploaded video with in-memory model inference and updates viewer state."""
+        import tempfile
+        import shutil
+        import torch
+        from lingbot_map.vis.sky_segmentation import apply_sky_segmentation
+
+        print(f"Processing uploaded video for active viewer: {file_name}")
+        
+        if self.model is None:
+            # Laptop / Mock mode fallback
+            print("Mock mode: Simulating model inference on uploaded video...")
+            # Generate new mock data to simulate successful upload and mapping
+            num_frames = 45
+            t_list = []
+            R_list = []
+            
+            # Generate a different layout (e.g. S-curve) to show it updated
+            for i in range(num_frames):
+                tz = float(i) * 0.4
+                tx = 2.0 * np.sin(float(i) * 0.2)
+                # Yaw rotation matching the tangent
+                yaw = 0.4 * np.cos(float(i) * 0.2)
+                R = np.array([
+                    [np.cos(yaw), 0.0, np.sin(yaw)],
+                    [0.0, 1.0, 0.0],
+                    [-np.sin(yaw), 0.0, np.cos(yaw)]
+                ])
+                t_list.append(np.array([tx, 0.0, tz]))
+                R_list.append(R)
+
+            self.cam_dict = {
+                "t": t_list,
+                "R": R_list,
+                "focal": [300.0] * num_frames,
+                "pp": [(250.0, 250.0)] * num_frames
+            }
+            
+            pc_list = []
+            color_list = []
+            conf_list = []
+            for i in range(num_frames):
+                t = t_list[i]
+                left_pts = np.stack([np.full(30, t[0]-2.0), np.zeros(30), np.linspace(t[2]-1.0, t[2]+3.0, 30)], axis=1)
+                right_pts = np.stack([np.full(30, t[0]+2.0), np.zeros(30), np.linspace(t[2]-1.0, t[2]+3.0, 30)], axis=1)
+                pts = np.concatenate([left_pts, right_pts], axis=0)
+                pts += np.random.normal(0, 0.05, pts.shape)
+                
+                pc_list.append(pts)
+                color_list.append(np.ones((len(pts), 3)) * 0.9)
+                conf_list.append(np.ones(len(pts)) * 1.5)
+                
+            self.pcs, self.all_steps = self.read_data(pc_list, color_list, conf_list)
+            self.num_frames = len(self.all_steps)
+            
+            cam_positions = np.array([self.cam_dict["t"][s] for s in self.all_steps])
+            x_coords = cam_positions[:, 0]
+            z_coords = cam_positions[:, 2]
+            x_center = (np.min(x_coords) + np.max(x_coords)) / 2.0
+            z_center = (np.min(z_coords) + np.max(z_coords)) / 2.0
+            max_range = max(np.ptp(x_coords), np.ptp(z_coords)) or 1.0
+            padding = max_range * 0.75
+            self.bev_x_min = x_center - padding
+            self.bev_x_max = x_center + padding
+            self.bev_z_min = z_center - padding
+            self.bev_z_max = z_center + padding
+            
+            # Populate dummy original images
+            self.original_images = [np.zeros((300, 400, 3), dtype=np.uint8) for _ in range(num_frames)]
+            print("Mock video upload successfully processed!")
+            return
+
+        # Real model inference mode
+        temp_dir = tempfile.mkdtemp(prefix="viser_web_upload_")
+        video_path = os.path.join(temp_dir, file_name)
+        with open(video_path, "wb") as f:
+            f.write(file_content)
+
+        fps_rate = getattr(self.args, "fps", 10)
+        stride = getattr(self.args, "stride", 3)
+        image_size = getattr(self.args, "image_size", 518)
+
+        from demo import load_images
+        images, paths, resolved_folder = load_images(
+            video_path=video_path,
+            fps=fps_rate,
+            first_k=None,
+            stride=stride,
+            image_size=image_size,
+            patch_size=getattr(self.args, "patch_size", 14),
+            rotate_clockwise_90=getattr(self.args, "rotate_clockwise_90", False),
+        )
+
+        images_gpu = images.to(self.device)
+        num_frames = images.shape[0]
+
+        # Resolve keyframe_interval dynamically for the uploaded video length
+        keyframe_interval = getattr(self.args, "keyframe_interval", None)
+        if keyframe_interval is None:
+            if getattr(self.args, "mode", "streaming") == "streaming" and num_frames > 320:
+                keyframe_interval = (num_frames + 319) // 320
+            else:
+                keyframe_interval = 1
+
+        with torch.no_grad(), torch.amp.autocast("cuda" if "cuda" in str(self.device) else "cpu", dtype=self.dtype if "cuda" in str(self.device) else torch.bfloat16):
+            if getattr(self.args, "mode", "streaming") == "streaming":
+                predictions = self.model.inference_streaming(
+                    images_gpu,
+                    num_scale_frames=self.args.num_scale_frames,
+                    keyframe_interval=keyframe_interval,
+                    output_device=None,
+                )
+            else:
+                predictions = self.model.inference_windowed(
+                    images_gpu,
+                    window_size=self.args.window_size,
+                    overlap_size=self.args.overlap_size,
+                    overlap_keyframes=self.args.overlap_keyframes,
+                    num_scale_frames=self.args.num_scale_frames,
+                    keyframe_interval=keyframe_interval,
+                    output_device=None
+                )
+
+        from demo import postprocess, prepare_for_visualization
+        predictions, images_cpu = postprocess(predictions, images)
+        preds_processed = prepare_for_visualization(predictions, images_cpu)
+
+        pc_list, color_list, conf_list, cam_dict = self._process_pred_dict(
+            preds_processed, use_point_map=False, mask_sky=False, image_folder=resolved_folder
+        )
+
+        self.pcs, self.all_steps = self.read_data(
+            pc_list, color_list, conf_list
+        )
+        self.cam_dict = cam_dict
+        self.num_frames = len(self.all_steps)
+
+        if self.cam_dict is not None and "t" in self.cam_dict and len(self.all_steps) > 0:
+            cam_positions = np.array([self.cam_dict["t"][s] for s in self.all_steps])
+            x_coords = cam_positions[:, 0]
+            z_coords = cam_positions[:, 2]
+            x_center = (np.min(x_coords) + np.max(x_coords)) / 2.0
+            z_center = (np.min(z_coords) + np.max(z_coords)) / 2.0
+            max_range = max(np.ptp(x_coords), np.ptp(z_coords)) or 1.0
+            padding = max_range * 0.75
+            self.bev_x_min = x_center - padding
+            self.bev_x_max = x_center + padding
+            self.bev_z_min = z_center - padding
+            self.bev_z_max = z_center + padding
+
+        shutil.rmtree(temp_dir)
+        print("Successfully processed video upload!")
 
     def run(self, background_mode: bool = False):
         """Run the viewer."""
@@ -1435,3 +690,153 @@ class PointCloudViewer:
         else:
             while True:
                 time.sleep(10.0)
+    def _get_2d_map_render(self, idx: int) -> np.ndarray:
+        W_p, H_p = 500, 500
+        img = np.full((H_p, W_p, 3), fill_value=[45, 30, 26], dtype=np.uint8)
+
+        if self.cam_dict is None or "t" not in self.cam_dict or len(self.all_steps) == 0:
+            return img
+
+        x_min = self.bev_x_min
+        x_max = self.bev_x_max
+        z_min = self.bev_z_min
+        z_max = self.bev_z_max
+
+        # Helper to convert world coordinates to pixel coordinates
+        def to_pixels(x, z):
+            px = int((x - x_min) / (x_max - x_min) * W_p) if x_max != x_min else W_p // 2
+            py = int((z_max - z) / (z_max - z_min) * H_p) if z_max != z_min else H_p // 2
+            return px, py
+
+        # 1. Render Free Space wedges
+        for i in range(idx + 1):
+            step = self.all_steps[i]
+            t = self.cam_dict["t"][step]
+            R = self.cam_dict["R"][step] if "R" in self.cam_dict else np.eye(3)
+            focal = self.cam_dict["focal"][step] if "focal" in self.cam_dict else 350.0
+            pp = self.cam_dict["pp"][step] if "pp" in self.cam_dict else (W_p / 2, H_p / 2)
+
+            # Determine distance of frustum wedge based on point cloud depths
+            d_frustum = 5.0
+            if step in self.pcs:
+                pc = self.pcs[step]["pc"]
+                conf = self.pcs[step]["conf"]
+                pts = pc.reshape(-1, 3)
+                conf_flat = conf.reshape(-1)
+                valid = np.isfinite(pts).all(axis=1)
+                if np.any(valid):
+                    pts = pts[valid]
+                    conf_flat = conf_flat[valid]
+                    mask = conf_flat > self.vis_threshold
+                    pts_valid = pts[mask]
+                    if len(pts_valid) > 0:
+                        dists = np.linalg.norm(pts_valid[:, [0, 2]] - t[[0, 2]], axis=1)
+                        d_frustum = np.percentile(dists, 90)
+                        d_frustum = np.clip(d_frustum, 1.0, 10.0)
+
+            # Camera directions in horizontal X-Z plane
+            dir_fwd = np.array([R[0, 2], R[2, 2]])
+            norm_fwd = np.linalg.norm(dir_fwd)
+            if norm_fwd > 1e-5:
+                dir_fwd = dir_fwd / norm_fwd
+
+            dir_right = np.array([R[0, 0], R[2, 0]])
+            norm_right = np.linalg.norm(dir_right)
+            if norm_right > 1e-5:
+                dir_right = dir_right / norm_right
+
+            # Frustum base half-width
+            fov_factor = pp[0] / focal
+            half_w = d_frustum * fov_factor
+
+            # Frustum corners in world coordinates
+            P_left = t[[0, 2]] + d_frustum * dir_fwd - half_w * dir_right
+            P_right = t[[0, 2]] + d_frustum * dir_fwd + half_w * dir_right
+
+            # Convert to pixel space
+            c_px = to_pixels(t[0], t[2])
+            l_px = to_pixels(P_left[0], P_left[1])
+            r_px = to_pixels(P_right[0], P_right[1])
+
+            pts_poly = np.array([c_px, l_px, r_px], dtype=np.int32)
+            cv2.fillPoly(img, [pts_poly], color=[216, 200, 178])
+
+        # 2. Render Obstacle points
+        all_pts_x = []
+        all_pts_z = []
+        for i in range(idx + 1):
+            step = self.all_steps[i]
+            if step in self.pcs:
+                pc = self.pcs[step]["pc"]
+                conf = self.pcs[step]["conf"]
+                pts = pc.reshape(-1, 3)
+                conf_flat = conf.reshape(-1)
+                valid = np.isfinite(pts).all(axis=1)
+                pts = pts[valid]
+                conf_flat = conf_flat[valid]
+                mask = conf_flat > self.vis_threshold
+                pts_valid = pts[mask]
+                if len(pts_valid) > 0:
+                    ds = max(1, len(pts_valid) // 150)
+                    all_pts_x.append(pts_valid[::ds, 0])
+                    all_pts_z.append(pts_valid[::ds, 2])
+
+        if len(all_pts_x) > 0:
+            pts_x = np.concatenate(all_pts_x)
+            pts_z = np.concatenate(all_pts_z)
+
+            # Map to pixel space
+            pxs = ((pts_x - x_min) / (x_max - x_min) * W_p).astype(np.int32)
+            pys = ((z_max - pts_z) / (z_max - z_min) * H_p).astype(np.int32)
+
+            mask_in = (pxs >= 0) & (pxs < W_p) & (pys >= 0) & (pys < H_p)
+            pxs = pxs[mask_in]
+            pys = pys[mask_in]
+
+            # Set obstacle pixels
+            img[pys, pxs] = [56, 200, 251]
+            img[np.clip(pys + 1, 0, H_p - 1), pxs] = [56, 200, 251]
+            img[pys, np.clip(pxs + 1, 0, W_p - 1)] = [56, 200, 251]
+
+        # 3. Draw Grid Lines and metric ticks
+        grid_min_x = int(np.floor(x_min / 5.0) * 5.0)
+        grid_max_x = int(np.ceil(x_max / 5.0) * 5.0)
+        grid_min_z = int(np.floor(z_min / 5.0) * 5.0)
+        grid_max_z = int(np.ceil(z_max / 5.0) * 5.0)
+
+        for gx in range(grid_min_x, grid_max_x + 5, 5):
+            px, _ = to_pixels(gx, z_min)
+            if 0 <= px < W_p:
+                cv2.line(img, (px, 0), (px, H_p), color=[60, 50, 40], thickness=1)
+                cv2.putText(img, str(gx), (px + 4, H_p - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, [150, 140, 130], 1)
+
+        for gz in range(grid_min_z, grid_max_z + 5, 5):
+            _, py = to_pixels(x_min, gz)
+            if 0 <= py < H_p:
+                cv2.line(img, (0, py), (W_p, py), color=[60, 50, 40], thickness=1)
+                cv2.putText(img, str(gz), (10, py - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, [150, 140, 130], 1)
+
+        # 4. Draw Camera Trajectory
+        traj_pts = []
+        for i in range(idx + 1):
+            step = self.all_steps[i]
+            t = self.cam_dict["t"][step]
+            px, py = to_pixels(t[0], t[2])
+            traj_pts.append([px, py])
+
+        if len(traj_pts) > 1:
+            cv2.polylines(img, [np.array(traj_pts, dtype=np.int32)], isClosed=False, color=[104, 206, 90], thickness=2)
+
+        # 5. Draw Active/Current Camera Position
+        if len(traj_pts) > 0:
+            cv2.circle(img, tuple(traj_pts[-1]), radius=6, color=[11, 221, 251], thickness=-1)
+
+        return img
+
+
+    def run(self, background_mode: bool = False):
+        import uvicorn
+        from backend.server import app
+        import backend.server
+        backend.server.viewer_instance = self
+        uvicorn.run(app, host="0.0.0.0", port=8000)

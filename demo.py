@@ -70,23 +70,30 @@ def load_images(image_folder=None, video_path=None, fps=10, image_ext=".jpg,.png
         src_fps = cap.get(cv2.CAP_PROP_FPS) or 30
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         interval = max(1, round(src_fps / fps))
+        effective_interval = interval * stride
         idx, saved = 0, []
         pbar = tqdm(total=total_frames, desc="Extracting frames", unit="frame")
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            if idx % interval == 0:
+            if idx % effective_interval == 0:
+                ret, frame = cap.read()
+                if not ret:
+                    break
                 path = os.path.join(out_dir, f"{len(saved):06d}.jpg")
                 cv2.imwrite(path, frame)
                 saved.append(path)
+            else:
+                ret = cap.grab()
+                if not ret:
+                    break
             idx += 1
             pbar.update(1)
         pbar.close()
         cap.release()
         paths = saved
         resolved_folder = out_dir
-        print(f"Extracted {len(paths)} frames from video ({total_frames} total, interval={interval})")
+        print(f"Extracted {len(paths)} frames from video ({total_frames} total, effective_interval={effective_interval})")
+        # Since stride has been factored into extraction, set it to 1 to avoid double-striding
+        stride = 1
     else:
         exts = image_ext.split(",")
         paths = []
@@ -219,7 +226,7 @@ def _warm_streaming(model, images, scale_frames, warm_stream_n, dtype,
     for _ in range(passes):
         model.clean_kv_cache()
         torch.compiler.cudagraph_mark_step_begin()
-        with torch.no_grad(), torch.amp.autocast("cuda", dtype=dtype):
+        with torch.no_grad(), torch.amp.autocast("cuda" if "cuda" in str(device) else "cpu", dtype=dtype if "cuda" in str(device) else torch.bfloat16):
             model.forward(
                 warm_scale,
                 num_frame_for_scale=scale_frames,
@@ -231,7 +238,7 @@ def _warm_streaming(model, images, scale_frames, warm_stream_n, dtype,
             if not is_keyframe:
                 model._set_skip_append(True)
             torch.compiler.cudagraph_mark_step_begin()
-            with torch.no_grad(), torch.amp.autocast("cuda", dtype=dtype):
+            with torch.no_grad(), torch.amp.autocast("cuda" if "cuda" in str(device) else "cpu", dtype=dtype if "cuda" in str(device) else torch.bfloat16):
                 model.forward(
                     warm_stream[:, i:i + 1],
                     num_frame_for_scale=scale_frames,
@@ -413,12 +420,41 @@ def main():
                         help="Save sky mask visualizations (original | mask | overlay) to this directory")
     parser.add_argument("--export_preprocessed", type=str, default=None,
                         help="Export stride-sampled, resized/cropped images to this folder")
+    parser.add_argument("--bev_stride", type=int, default=3,
+                        help="Step stride for 2D BEV map rendering (renders frustums/points every N frames for speed and sparse map)")
 
     args = parser.parse_args()
-    assert args.image_folder or args.video_path, \
-        "Provide --image_folder or --video_path"
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # If no initial image_folder or video_path is provided, start directly in empty viewer mode
+    if args.image_folder is None and args.video_path is None:
+        print("[*] No input folder/video provided. Starting Viser directly in empty mode...")
+        model = load_model(args, device)
+        model.eval()
+        
+        if torch.cuda.is_available():
+            dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+        else:
+            dtype = torch.float32
+            
+        if dtype != torch.float32 and getattr(model, "aggregator", None) is not None:
+            print(f"Casting aggregator to {dtype} (heads kept in fp32)")
+            model.aggregator = model.aggregator.to(dtype=dtype)
+            
+        from lingbot_map.vis import PointCloudViewer
+        viewer = PointCloudViewer(
+            model=model,
+            pred_dict=None,
+            port=args.port,
+            vis_threshold=args.conf_threshold,
+            downsample_factor=args.downsample_factor,
+            point_size=args.point_size,
+            mask_sky=args.mask_sky,
+            device=device,
+        )
+        print(f"Web Dashboard backend starting on port 8000")
+        viewer.run()
+        return
 
     # ── Load images & model ──────────────────────────────────────────────────
     t0 = time.time()
@@ -542,7 +578,7 @@ def main():
 
     output_device = torch.device("cpu") if args.offload_to_cpu else None
 
-    with torch.no_grad(), torch.amp.autocast("cuda", dtype=dtype):
+    with torch.no_grad(), torch.amp.autocast("cuda" if "cuda" in str(device) else "cpu", dtype=dtype if "cuda" in str(device) else torch.bfloat16):
         if args.mode == "streaming":
             predictions = model.inference_streaming(
                 images,
@@ -584,15 +620,14 @@ def main():
     try:
         from lingbot_map.vis import PointCloudViewer
         viewer = PointCloudViewer(
+            model=model,
             pred_dict=prepare_for_visualization(predictions, images_cpu),
             port=args.port,
             vis_threshold=args.conf_threshold,
             downsample_factor=args.downsample_factor,
             point_size=args.point_size,
             mask_sky=args.mask_sky,
-            image_folder=resolved_image_folder,
-            sky_mask_dir=args.sky_mask_dir,
-            sky_mask_visualization_dir=args.sky_mask_visualization_dir,
+            device=device,
         )
         print(f"3D viewer at http://localhost:{args.port}")
         viewer.run()
